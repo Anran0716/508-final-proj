@@ -258,7 +258,7 @@ for(i in vars){
     labs(title=i)+
     mapTheme()+
     theme(legend.position="bottom")}
-do.call(grid.arrange,c(varList,ncol=4,top="Figure 6. Local Morans I statistics, Drug"))
+do.call(grid.arrange,c(varList,ncol=4,top="Figure 5. Local Morans I statistics, Drug"))
 
 final_net <- final_net %>% 
   mutate(drug.isSig = 
@@ -285,13 +285,13 @@ ggplot(correlation.long,aes(Value,countDrug))+
             x=-Inf,y=Inf,vjust=1.5,hjust=-.1)+
   geom_smooth(method="lm",se=FALSE,colour="black")+
   facet_wrap(~Variable,ncol=2,scales="free")+
-  labs(title="Figure 8. Heroin count as a function of risk factors")+
+  labs(title="Figure 6. Heroin count as a function of risk factors")+
   plotTheme()
 
 #A histogram of your dependent variable.
 ggplot(final_net, aes(countDrug)) + 
   geom_histogram(binwidth = 1) +
-  labs(title = "Figure 9. Heroin distribution")
+  labs(title = "Figure 7. Heroin distribution")
 
 #Cross-validated Poisson Regression
 crossValidate <- function(dataset, id, dependentVariable, indVariables) {
@@ -388,7 +388,7 @@ error_by_reg_and_fold %>%
   geom_histogram(bins = 30, colour="black", fill = "#FDE725FF") +
   facet_wrap(~Regression) +  
   geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
-  labs(title="Figure 10. Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+  labs(title="Figure 8. Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
        x="Mean Absolute Error", y="Count") +
   plotTheme()
 
@@ -489,7 +489,7 @@ rbind(drug_KDE_sf, drug_risk_sf) %>%
   facet_wrap(~label, ) +
   scale_fill_viridis(discrete = TRUE) +
   labs(title="Figure 12. Comparison of Kernel Density and Risk Predictions",
-       subtitle="2017 drug risk predictions; 2018 drug") +
+       subtitle="2016 drug risk predictions; 2017 drug") +
   mapTheme(title_size = 14)
 
 #The bar plot making this comparison.
@@ -508,3 +508,26 @@ rbind(drug_KDE_sf, drug_risk_sf) %>%
   theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
 
 #user case?
+health_center<-read_csv("C:/Users/zheng/Downloads/Cincinnati_Health_Department_Health_Care_Centers.csv")%>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>% 
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102258') %>%
+  mutate(Legend = "Health care centres")
+
+
+#create 1/2 mile buffer zone around each heath center
+health_center_buffer <-  rbind(
+  st_buffer(health_center, 800) %>%
+    mutate(Legend = "Buffer") %>%
+    dplyr::select(Legend)%>%
+  st_union(st_buffer(health_center, 800)) %>%
+    st_sf() %>%
+    mutate(Legend = "Unioned Buffer"))
+
+ggplot() +
+  geom_sf(data=drug_risk_sf, aes(fill = Risk_Category), colour = NA) +
+  scale_fill_viridis(discrete = TRUE) +
+  geom_sf(data=health_center_buffer, colour = "red", fill = "transparent") +
+  labs(title = "Figure 14. Health care centres distribution under risk prediction", subtitle = "The red border indicates areas within 1/2 mile to health care centers.") +
+  mapTheme()
