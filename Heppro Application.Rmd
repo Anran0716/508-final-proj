@@ -1,0 +1,827 @@
+---
+title: "Heppro application - an overdose first-aid packets allocation tool"
+author: "Shimin Tu, Anran Zheng"
+date: "12/15/2021"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+<style type="text/css">
+  body{
+  font-size: 12pt;
+}
+</style>
+
+# 1. Use Case
+
+Drug overdose is threatening the life of people. According to a report about drug overdose released by Violence & Injury Prevention Section of Department of Health in Ohio, unintentional drug poisoning has been the leading cause of injury death since 2007. In 2019, 4028 people died of unintentional drug overdoses in Ohio, and Black Non-Hispanics occupied the highest rate. The best way to deal with an overdose is to get the patient to a medical institution in time. However, there are patients who were so far from heath care centers that they couldn’t receive professional treatment quickly. There are also patients who are too impoverished to pay the medical bill. In the face of the growing threat of drug overdose, how can we help patients get rapid and affordable aids?
+
+An application named Heppro which provides self-supporting and rapid help is in the way. Essentially, Heppro works as a medical resource allocation tool. The medical resource here in fact are overdose first-aid packets, which include injectors, naloxone, bottled water and foods. Those packets are allocated to relief stations, and the total number of packets for the year is decided by overdose prediction. Overdose patients can go to those relief stations and pick up first-aid packet for free.
+
+To perform such an efficient and meaningful application, building an accurate and generalized overdose prediction model is significant. In this project, we are going to take heroin overdose in Cincinnati as an example and build an overdose model with heroin overdose data. Instead of traditional administrative division like census tracts or neighborhood, we are going to divide Cincinnati into small grid cells and set a relief station in each grid cell, then predict the overall number of heroin overdose cases in each grid cell next year. 
+
+The number of first-aid packets that are distributed depends on the prediction outcome. However, there is difference of packets number between grid cells which are near to health care centers and grid cells which are far from medical institutions. For relief station not within half a mile of health care centers, the number of aid-packets is equal to the number of heroin overdose cases that is predicted. While for those within half a mile, the number of aid-packets is only the half of the predicted heroin overdose cases. That’s because patients in a half-mile buffer of medical institutions can get more rapid treatment.
+
+Maybe it sounds unreasonable to set the number of first-aid packets to match the number of cases, since some of patients may go directly to health care centers instead of getting first-aid packets, and someone may doubt whether it will cause a waste of resource. However, heroin overdose cases in our current data are only those were observed, there were hundreds of patients who didn’t ask for emergent help due to all kinds of reasons.  We should reserve space for those invisible patients.
+
+The main user of our application is the Department of Health. In our application, officials can get the information including where heroin overdose cluster, how many overdose cases may happen in each grid cell in the next year, and how many first-aid packets should be allocated to every grid cell based on their location and prediction outcome. After adopting our application, the Department of Health should inform people about the first-aid packet policy and where to pick it up.
+
+
+# 2. Overdose Prediction Model
+
+We build four models at first, and select the best one by comparing their accuracy and generalizability. The best model is based on heroin overdose data from Cincinnati in 2016, and use environmental risk factors from 311 requests and crime data as features. Spatial process is also explained in our model and LOGO-CV method is applied. In the end, we compare it to the traditional kernel density mapping, and find that our model performs better. Next are the specific steps of modeling.
+
+```{r setup, include=FALSE,message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+```
+
+## 2.1 Data Wrangling
+
+The heroin overdose data of Cincinnati which contains each case' time and location is firstly loaded. Heroin overdose cases in 2016 are extracted as the training set to build a model, while cases in 2017 are filtered as the test set to evaluate the model. Cincinnati Boundary is also imported, which is useful in visualization. The boundary data is available on ArcGIS Hub.
+
+```{r loaddata, message=FALSE,results = 'hide'}
+cin_overdose<- st_read("/Users/tushimin/Desktop/508-final-proj/Cinci_Overdoses.geojson") %>%
+  st_transform('ESRI:102258')
+
+#build prediction dataset with test=0 (year2016)
+drug16<-cin_overdose%>%
+  filter(test==0)%>%
+  st_transform('ESRI:102258')
+
+#build test dataset with test=0 (year2017)
+drug17<-cin_overdose%>%
+  filter(test==1)%>%
+  st_transform('ESRI:102258')
+
+cin_boundary <- st_read("https://opendata.arcgis.com/datasets/ed78f4754b044ac5815d0a9efe9bb336_1.geojson") %>%
+  st_transform('ESRI:102258')
+```
+
+Let's map heroin overdose cases in the format of point and density, which provide basic understanding of distribution of overdose. The density map is especially helpful in targeting overdose hot spots. It seems heroin overdose cases in Cincinnati,2016 mainly cluster in two cores, one is in the northwest, the other is in the northeast. 
+
+```{r overdosedistribution}
+grid.arrange(ncol=2,
+             ggplot() + 
+               geom_sf(data = cin_boundary) +
+               geom_sf(data = drug16, colour="red", size=0.1, show.legend = "point") +
+               labs(title= "Heroin overdose, Cincinnati - 2016",caption="Figure 1. Visualizing Heroin overdose as points and density") +
+               mapTheme(title_size = 14),
+             
+             ggplot() + 
+               geom_sf(data = cin_boundary, fill = "grey40") +
+               stat_density2d(data = data.frame(st_coordinates(drug16)), 
+                              aes(X, Y, fill = ..level.., alpha = ..level..),
+                              size = 0.01, bins = 40, geom = 'polygon') +
+               scale_fill_viridis_c(option="A",name="")+
+               scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+               labs(title = "Density of Heroin overdose, Cincinnati") +
+               mapTheme(title_size = 14) + theme(legend.position = "none"))
+```
+
+
+### 2.1.1 Joining overdose to the fishnet
+
+Comparing to neighborhood, census tracts or other administrative division, the fishnet defined by ourselves is better to be chosen as the appropriate unit of analysis. In fact, overdose risk is not a phenomenon that varies across administrative units, and just what is shown in the density map, overdose risk clustered in space and dissipates outward from hot spots. Consequently, a smaller and more random unit analysis is much better in our project. After creating the fishnet, we count the number of heroin overdose cases in each grid cell. The warmer the color, the higher the number. It is apparent that grid cells in two cores have most overdose cases.
+
+```{r creatfishnet}
+#Creating the fishnet
+fishnet <- 
+  st_make_grid(cin_boundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[cin_boundary] %>%         
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+drug_net <- 
+  dplyr::select(drug16) %>% 
+  mutate(countDrug = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countDrug = replace_na(countDrug, 0),
+         uniqueID = rownames(.),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+# visualize the count
+ggplot() +
+  geom_sf(data = drug_net, aes(fill = countDrug), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Figure 2. Count of Heroin overdose for the fishnet") +
+  mapTheme()
+```
+
+
+### 2.1.2 Wrangling risk factors
+
+Several environmental factors are imported as predictors, including 311 reports of junk cars, street lights out, graffiti, street lights out, vacant buildings, dead animals, and pot holes as well as assault crimes.
+
+```{r load_risk_factors, message=FALSE, warning=FALSE, results='hide'}
+#Wrangling risk factors
+request311 <- read.socrata("https://data.cincinnati-oh.gov/resource/4cjh-bm8b.json") %>%
+  filter(requested_date >= "2016-01-01T00:00:00.00Z" & requested_date <= "2016-12-31T00:00:00.00Z") #select only year 2016 for prediction
+
+junk_cars<-request311%>%
+  filter(stringr::str_detect(service_code, "ABAN-VNA"))%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Junk_Cars")
+
+graffiti<-request311%>%
+  filter(stringr::str_detect(service_code, "GRFITI"))%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Graffiti")
+
+streetLightsOut <-request311%>%
+  filter(stringr::str_detect(service_code, "STRTLITE"))%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Street_Lights_Out")
+
+dead_ani<-request311%>%
+  filter(stringr::str_detect(service_code, "DAPUB1"))%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Dead_Animal")
+
+pot_hole<-request311%>%
+  filter(stringr::str_detect(service_code, "PTHOLE"))%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Pot_Hole")
+
+vac_building<-request311%>%
+  filter(stringr::str_detect(service_code, "BLD_VACR"))%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Vacant_Building")
+
+#crime data of year 2016
+crime16 <- read.socrata("https://data.cincinnati-oh.gov/resource/k59e-2pvf.json")%>%
+  filter(date_reported >= "2016-01-01T00:00:00.00Z" & date_reported <= "2016-12-31T00:00:00.00Z")%>%
+   filter(offense=='ASSAULT')%>%
+  dplyr::select(Y = latitude_x, X = longitude_x) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X","Y"), crs=4326, agr="constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "ASSAULT")
+```
+
+## 2.2 Feature Engineering
+
+### 2.2.1 Neighbor features count
+
+We sum the count of events in each grid cell and visualize them. These risk factors illustrate slightly different spatial processes. Assaults and vacant buildings were mostly clustered in two hot spots of heroin overdose, while the junk cars and pot holes distributed randomly. The 311 requests for graffiti tend to cluster in the center Cincinnati, and those for street lights out heavily concentrated on the south area. Though reports of dead animals distributed relatively evenly across the city, the southeastern of Cincinnati witnessed more comparing to other places.
+
+```{r risk_factor_count, message=FALSE, warning=FALSE}
+#Feature engineering - Count of risk factors by grid cell
+vars_net <-
+  rbind(junk_cars,streetLightsOut,dead_ani,
+        vac_building, graffiti, pot_hole,crime16)%>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+  full_join(fishnet, by = "uniqueID") %>%
+  spread(Legend, count, fill=0) %>%
+  st_sf() %>%
+  dplyr::select(-`<NA>`) %>%
+  na.omit() %>%
+  ungroup()
+
+vars_net.long<-gather(vars_net,Variable,value,-geometry,-uniqueID)
+vars<-unique(vars_net.long$Variable)
+mapList<-list()
+for(i in vars)
+{mapList[[i]]<-
+  ggplot()+
+  geom_sf(data=filter(vars_net.long,Variable==i),
+          aes(fill=value),colour=NA)+
+  scale_fill_viridis(name="")+
+  labs(title=i)+
+  mapTheme()}
+
+do.call(grid.arrange,c(mapList,ncol=3,top="Figure 3. Risk Factors by Fishnet"))
+```
+
+### 2.2.2 Nearest neighbor features 
+
+Another feature engineering method we use is to calculate the average nearest neighbor distance to hypothesize a smoother exposure relationship across space. Here we measure average distance between centroid points of grid cells and their 3 nearest risk factors, which are then plotted as Figure 4.
+
+```{r nn_fucntion_use, message=FALSE, warning=FALSE,results='hide'}
+##Feature engineering - Nearest Neighbor Feature
+nn_function <- function(measureFrom,measureTo,k) {
+  measureFrom_Matrix <-
+    as.matrix(measureFrom)
+  measureTo_Matrix <-
+    as.matrix(measureTo)
+  nn <-   
+    get.knnx(measureTo, measureFrom, k)$nn.dist
+  output <-
+    as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint) %>%
+    pull()
+  
+  return(output)  
+}
+
+st_c    <- st_coordinates
+st_coid <- st_centroid
+
+vars_net <-
+  vars_net %>%
+  mutate(
+    junk_cars.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(junk_cars),3),
+    streetLightsOut.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(streetLightsOut),3),
+    dead_ani.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(dead_ani),3),
+    vac_building.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(vac_building),3),
+    graffiti.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(graffiti),3),
+    pot_hole.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(pot_hole),3),
+    assault.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(crime16),3))
+```
+
+
+```{r nnfeature_visualization}
+## Visualize the NN feature
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+  gather(Variable, value, -geometry)
+
+vars <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(vars_net.long.nn, Variable == i), aes(fill=value), colour=NA) +
+    scale_fill_viridis(name="")+
+    labs(title=i) +
+    mapTheme()}
+
+do.call(grid.arrange,c(mapList,ncol=3,top="Figure 4. Nearest Neighbor risk Factors by Fishnet"))
+```
+
+### 2.2.3 Create the final_net
+
+Features engineered in the last step are joined into the heroin overdose fishnet, and the neighborhood data is also spatially joined based on the centroid of grid cells. In this way, the final fishnet is completed.
+
+```{r final_fishnet, message=FALSE, warning=FALSE,result=FALSE,echo=FALSE}
+# import neighborhood data
+neighborhoods <-
+  st_read(paste0("https://opendata.arcgis.com/datasets/572561553c9e4d618d2d7939c5261d46_0.geojson")) %>%
+  st_transform('ESRI:102258')
+
+#create final_set
+final_net<-left_join(drug_net,st_drop_geometry(vars_net),by="uniqueID")
+
+final_net<-st_centroid(final_net)%>%
+  st_join(dplyr::select(neighborhoods,SNA_NAME))%>%
+  st_drop_geometry()%>%
+  left_join(dplyr::select(final_net,geometry,uniqueID))%>%
+  st_sf()%>%
+  na.omit()
+
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+```
+
+
+## 2.3 Spatial Process of Heroin Overdose
+
+### 2.3.1 Local Moran's I
+
+Since it seems that there are hotspots of heroin overdose, we introduce a statistic called Local Moran's I to account for the local spatial process. The null hypothesis is that the burglary count at a given location is randomly distributed relative to its immediate neighbors, and a nearest neighbor weights matrix is applied.   
+The below multiple maps visualize overdose count, Local Moran's I value, the p-value and significant hotspots. Those two areas with relatively high values of I represent strong and statistically significant evidence of local clustering, and the fact can be testified by the p-value figure and the significant hotspots map.
+
+```{r local_moransi}
+## see local moran
+local_morans <- localmoran(final_net$countDrug, final_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+# join local Moran's I results to fishnet
+final_net.localMorans <- 
+  cbind(local_morans, as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Drug_Count = countDrug, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+```
+
+```{r, results = 'hide', message=FALSE, warning=FALSE, cache=FALSE,fig.width=10,fig.height=11}
+vars<-unique(final_net.localMorans$Variable)
+varList<-list()
+for(i in vars){
+  varList[[i]]<-
+    ggplot()+
+    geom_sf(data=filter(final_net.localMorans,Variable==i),
+            aes(fill=Value),colour=NA)+
+    scale_fill_viridis(name="")+
+    labs(title=i)+
+    mapTheme()+
+    theme(legend.position="bottom")}
+do.call(grid.arrange,c(varList,ncol=2,top="Figure 5. Local Morans I statistics, Heroin"))
+```
+
+With Local Moran's /, we are sure there are significant clusters of overdose, which means we should take the spatial process into consideration when building the model. Consequently we add two new variables, one is a dummy variable drug.isSig denoting a cell as part of a significant cluster (a p-value <= 0.0000001), the other is drug.isSig.dist representing average nearest neighbor distance from each cell centroid to its nearest significant cluster.
+
+```{r joininfishnet, message=FALSE, warning=FALSE}
+final_net <- final_net %>% 
+  mutate(drug.isSig = 
+           ifelse(local_morans[,5] <= 0.001, 1, 0)) %>%
+  mutate(drug.isSig.dist = 
+           nn_function(st_c(st_coid(final_net)),
+                       st_c(st_coid(filter(final_net, 
+                                           drug.isSig == 1))), 
+                       k = 1))
+```
+
+
+### 2.3.2 Correlation tests
+
+Correlation gives important context while also providing intuition on features that may predict heroin overdose. The code block below creates a small multiple scatterplot of heroin overdose as a function of the risk factors. We should select either the count or nearest neighbor feature in order to avoid colinearity. Because the R squares of count of risk factors are generally higher than those of neighborhood nearest features, we are going to include count of risk factors into our regression model.
+
+```{r, results = 'hide', message=FALSE, warning=FALSE, cache=FALSE,fig.width=6,fig.height=15}
+#Correlation test
+correlation.long<-st_drop_geometry(final_net)%>%
+  dplyr::select(-uniqueID,-cvID,-SNA_NAME)%>%
+  gather(Variable,Value,-countDrug)
+
+correlation.cor<-correlation.long%>%
+  group_by(Variable)%>%
+  summarize(correlation=cor(Value,countDrug,use="complete.obs"))
+
+ggplot(correlation.long,aes(Value,countDrug))+
+  geom_point(size=0.1)+
+  geom_text(data=correlation.cor,
+            aes(label=paste("r=",round(correlation,2))),
+            x=-Inf,y=Inf,vjust=1.5,hjust=-.1)+
+  geom_smooth(method="lm",se=FALSE,colour="black")+
+  facet_wrap(~Variable,ncol=2,scales="free")+
+  labs(title="Figure 6. Heroin count as a function of risk factors")+
+  plotTheme()
+```
+
+## 2.4  Poisson Regression
+
+The Figure7 is the histogram of heroin overdose with skewed distribution, which means in the most grid cells there contains no heroin overdose. Consequently, since overdose's distribution characteristic, we select a Poisson Regression to build our model.
+
+```{r his_dv}
+#A histogram of your dependent variable.
+ggplot(final_net, aes(countDrug)) + 
+  geom_histogram(binwidth = 1, fill="#334f65",color='black') +
+  labs(title = "Figure 7. Heroin overdose distribution")
+```
+
+### 2.4.1 Cross-validated Poisson Regression
+
+Because heroin overdose has spatial process, spatial cross-validation becomes important. Here we choose ‘Leave-one-group-out’ cross-validation (LOGO-CV) method. LOGO-CV assumes the local spatial process from all other neighborhoods generalizes to the hold-out. The concrete way is to hold out one local area, train the model on the remaining n - 1 areas, predict for the hold out, and record the goodness of fit. With LOGO-CV both citywide and local spatial scales could be learned by overdose predictive model. Random K-fold cross validation method is also included in our model. A random generated cvID associated with each grid cell will be used for random k-fold cross-validation, while Neighborhood name will be used for spatial cross-validation.
+
+```{r cv_function}
+#Cross-validated Poisson Regression
+crossValidate <- function(dataset, id, dependentVariable, indVariables) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <-
+      glm(countDrug ~ ., family = "poisson", 
+          data = fold.train %>% 
+            dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+```
+
+The code block below runs crossValidate to estimate four different regressions.  
+reg.cv and reg.ss.cv perform random k-fold cross validation using Just Risk Factors and the Spatial Process features, respectively.  
+reg.spatialCV and reg.ss.spatialCV perform LOGO-CV, spatial cross-validation on neighborhood name, using the aforementioned two sets of features.  
+We are going to compare their accuracy and generalizability in following steps and select the best one as the techinical support of Heppro Application.
+
+```{r cross_validation, message=FALSE, warning=FALSE,results = FALSE}
+reg.vars <- c("Junk_Cars", "Street_Lights_Out", "Dead_Animal", 
+              "Pot_Hole", "Graffiti", "Vacant_Building","ASSAULT")
+
+reg.ss.vars <- c("Junk_Cars", "Street_Lights_Out", "Dead_Animal", 
+              "Pot_Hole", "Graffiti", "Vacant_Building", "drug.isSig", "drug.isSig.dist","ASSAULT")
+
+#Random k-fold CV
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countDrug",
+  indVariables = reg.vars) %>%
+  dplyr::select(cvID = cvID, countDrug, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countDrug",
+  indVariables = reg.ss.vars) %>%
+  dplyr::select(cvID = cvID, countDrug, Prediction, geometry)
+
+## RUN Spatial LOGO-CV
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "SNA_NAME",                           
+  dependentVariable = "countDrug",
+  indVariables = reg.ss.vars) %>%
+  dplyr::select(cvID = SNA_NAME, countDrug, Prediction, geometry)
+
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "SNA_NAME",
+  dependentVariable = "countDrug",
+  indVariables = reg.vars) %>%
+  dplyr::select(cvID = SNA_NAME, countDrug, Prediction, geometry)
+
+```
+
+
+
+### 2.4.2 Accuracy & Generalzability
+
+A host of goodness of fit metrics are calculated below including mean error and absolute mean error. The Figure.8 visualizes MAE for each fold across each regression. MAE become smaller and large errors disappear after spatial process is taken into consideration，which proved that there is a shared local heroin overdose experience across Cincinnati, and accounting for it improves the model.  
+
+```{r regression_error, message=FALSE, warning=FALSE,results='hide'}
+reg.summary <- 
+  rbind(
+    mutate(reg.cv,           Error = Prediction - countDrug,
+           Regression = "Random k-fold CV: Just Risk Factors"),
+    
+    mutate(reg.ss.cv,        Error = Prediction - countDrug,
+           Regression = "Random k-fold CV: Spatial Process"),
+    
+    mutate(reg.spatialCV,    Error = Prediction - countDrug,
+           Regression = "Spatial LOGO-CV: Just Risk Factors"),
+    
+    mutate(reg.ss.spatialCV, Error = Prediction - countDrug,
+           Regression = "Spatial LOGO-CV: Spatial Process")) %>%
+  st_sf() 
+
+error_by_reg_and_fold <- 
+  reg.summary %>%
+  group_by(Regression, cvID) %>% 
+  summarize(Mean_Error = mean(Prediction - countDrug, na.rm = T),
+            MAE = mean(abs(Mean_Error), na.rm = T),
+            SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+  geom_histogram(bins = 30, colour="black", fill = "#334f65") +
+  facet_wrap(~Regression) +  
+  geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
+  labs(title="Figure 8. Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+       x="Mean Absolute Error", y="Count") +
+  plotTheme()
+```
+
+In the table.1, we  calculate the mean and standard deviation in errors grouped by regression. It is apparent that models containing the Spatial Process features have lower mean MAE and standard deviation in errors. The model looks like less persuasive for LOGO-CV, that's the outcome of LOGO-CV's conservative assumption.
+
+```{r MAE} 
+# A table of MAE and standard deviation MAE by regression
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>% 
+  summarize(Mean_MAE = round(mean(MAE), 2),
+            SD_MAE = round(sd(MAE), 2)) %>%
+  kable(caption = "Table 1. MAE and standard deviation MAE by regression") %>%
+  kable_styling("striped", full_width = F) %>%
+  row_spec(2, color = "black", background = "#3682be") %>%
+  row_spec(4, color = "black", background = "#3682be") 
+```
+
+Figure 9 visualizes the LOGO-CV errors spatially. When spatial process is included in the regression, there are lower errors. And largest errors happen in the hotspots. Consequently, spatial process is so indispensible that shouldn't be omiteed when buidling overdose prediction model.
+
+```{r , results = 'hide', message=FALSE, warning=FALSE, cache=FALSE,fig.width=15}
+error_by_reg_and_fold %>%
+  filter(str_detect(Regression, "LOGO")) %>%
+  ggplot() +
+    geom_sf(aes(fill = MAE)) +
+    facet_wrap(~Regression) +
+    scale_fill_viridis() +
+    labs(title = "Figure 9. model errors by random k-fold and spatial cross validationn") +
+    mapTheme() + theme(legend.position="bottom")
+```
+
+
+2.4.3 Generalizability by neighborhood context
+
+In the risk prediction model, we care more about generalizability than accuracy, since overdoses are rare events and it is useless to predict accurately where the overdose was yesterday.  
+There are two aspects of generalizability, one is that the model can accurately predict the new data, the other is that our model predicts with comparable accuracy across different group contexts.  
+let's close your eyes and imagine a neighborhood full of drugs. Is it dilapidated? Is it impecunious? Is it a minority community? And is what you imagined now your stereotype? There are selection bias in our data itself,and maybe we have added other bias unconsciously into the model, which are detrimental to generalizability of our model. As a consequence, we are going to test whether our model generalize across different neighborhood contexts with race and median household income data via tidycensus.  
+We calculate the percent of white people in each neighborhood, we name neighborhoods consisting of more than 50% white people as "Majority_White", while other neighborhoods as "Majority_Non_White". And we also divide all neighborhoods into "High Income" and "Low Income" based on mean value of average household income in Cincinnati.
+
+
+```{r census data, results = 'hide', include=TRUE, cache = FALSE, message = FALSE, warning = FALSE,echo=FALSE}
+#Generalizability by race/income context
+#A table of raw errors by race context for a random k-fold vs. spatial cross validation regression.
+census_api_key("e79f3706b6d61249968c6ce88794f6f556e5bf3d", overwrite = TRUE)
+tracts16 <- 
+  get_acs(geography = "tract", variables = c("B01001_001E",# TotalPop
+                                             "B01001A_001E", #white
+                                             "B06011_001E"), #income
+          year = 2016, state=39, county=061, geometry=T) %>%
+  st_transform('ESRI:102258')  %>% 
+  dplyr::select(variable, estimate, GEOID) %>%
+  spread(variable, estimate) %>%
+  rename(TotalPop = B01001_001,
+         NumberWhites = B01001A_001,
+         Income=B06011_001) 
+
+tracts16 <- tracts16 %>%
+        mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority_White", "Majority_Non_White"),
+         IncContext = ifelse(Income > median(tracts16$Income), "High Income", "Low income")) %>%
+  .[neighborhoods,]
+```
+
+Just like maps below show, Cincinnati is a very segregated city, non-white and low-household-income clustered in the center city, while white and high-household-income people mainly live in suburbs.  
+The table2 and table3 compares average (non-absolute) errors for the LOGO-CV regressions by race and income context respectively, by joining the fishnet grid cell centroids to tract boundaries.  
+Since error is calculated by subtracting the observed heroin overdose from the prediction. Thus, a positive difference represents an over-prediction. The model on average, under-predicts in low income neighborhoods and over-predicts in high income neighborhoods, as well as over-predicts both in Majority_Non_White and Majority_White neighborhoods. Over-prediction is not a bad thing, since there must have been unreported heroin overdose cases.  
+In addition, the Spatial Process model performs better again, since it has a smaller difference in errors across neighborhood context.
+
+```{r race, message=FALSE, warning=FALSE}
+ggplot() + 
+geom_sf(data = na.omit(tracts16),
+              aes(fill = raceContext)) +
+               scale_fill_manual(values = c("#334f65","#3682be"),name="Race Context") +
+               labs(title = "Figure 10. Test of generalizability under race context") +
+               mapTheme() + theme(legend.position="bottom")
+```
+
+```{r message=FALSE, warning=FALSE}
+ggplot() + 
+geom_sf(data = na.omit(tracts16),
+              aes(fill = IncContext)) +
+               scale_fill_manual(values = c("#3682be", "#334f65"),
+               name="Income Context") +
+               labs(title = "Figure 11. Test of generalizability under income context") +
+               mapTheme() + theme(legend.position="bottom")
+```
+
+```{r race_context, message=FALSE, warning=FALSE}
+reg.summary %>% 
+  filter(str_detect(Regression, "LOGO")) %>%
+  st_centroid() %>%
+  st_join(tracts16) %>%
+  na.omit() %>%
+  st_drop_geometry() %>%
+  group_by(Regression, raceContext) %>%
+  summarize(mean.Error = mean(Error, na.rm = T)) %>%
+  spread(raceContext, mean.Error) %>%
+  kable(caption = "Table 2. Mean Error by neighborhood racial context") %>%
+  kable_styling("striped", full_width = F) 
+```
+
+```{r income context, message=FALSE, warning=FALSE}
+reg.summary %>% 
+  filter(str_detect(Regression, "LOGO")) %>%
+  st_centroid() %>%
+  st_join(tracts16) %>%
+  na.omit() %>%
+  st_drop_geometry() %>%
+  group_by(Regression, IncContext) %>%
+  summarize(mean.Error = mean(Error, na.rm = T)) %>%
+  spread(IncContext, mean.Error) %>%
+  kable(caption = "Table 3. Mean Error by neighborhood income context") %>%
+  kable_styling("striped", full_width = F) 
+```
+
+### 2.4.3 Comparison of kernel density and overdose predictions.
+
+By comparing the accuracy and generalizability of four models we already created, the forth model **Spatial LOGO-CV: Spatial Process** which explains the spatial process and contains LOGO cross validation is the best one, and is adopted in our application. Let's compare its efficiency with the traditional method.  
+‘Kernel density’ hotspot mapping is a widely used method adopted by public departments to allocate resources in the real world. In this part, we are going to test whether our risk prediction model outperforms traditional kernel density mapping, and at the same time, evaluate the across-time generalizability of the model. The hotsopt and risk predictions from 2016 heroin overdose are used to predict the location of overdose from 2017.  
+We compute the Kernel Density on 2016 heroin overdose and predict overdose risk with prediction model respectively, then scale kernel density and predicted values to run from 1-100 and then reclassify those values into 5 risk categories. The points in maps below are observed heroin overdose cases happened in 2018.  
+It seems like that the risk predictions capture more observed overdose than the kernel density, so our risk prediction model provides a more robust targeting tool for allocating medical resources. Our risk prediction model also performs well across time. 
+
+```{r ppp, message=FALSE, warning=FALSE}
+#Density vs. prediction
+drug_ppp <- as.ppp(st_coordinates(drug16), W = st_bbox(final_net))
+drug_KD.1000 <- spatstat.core::density.ppp(drug_ppp, 1000)
+
+drug_KDE_sf <- as.data.frame(drug_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = ntile(value, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70% to 89%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50% to 69%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30% to 49%",
+           Risk_Category >= 1 & Risk_Category  <= 29 ~ "1% to 29%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(drug17) %>% mutate(drugCount = 1), ., sum) %>%
+      mutate(burgCount = replace_na(drugCount, 0))) %>%
+  dplyr::select(label, Risk_Category, drugCount)
+
+drug_risk_sf <-
+  reg.ss.spatialCV %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category = ntile(Prediction, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70% to 89%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50% to 69%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30% to 49%",
+           Risk_Category >= 1 & Risk_Category <= 29 ~ "1% to 29%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(drug17) %>% mutate(drugCount = 1), ., sum) %>%
+      mutate(burgCount = replace_na(drugCount, 0))) %>%
+  dplyr::select(label,Risk_Category, drugCount)
+
+rbind(drug_KDE_sf, drug_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+  geom_sf(aes(fill = Risk_Category), colour = NA) +
+  geom_sf(data = drug17, size = .2, colour = "black") +
+  facet_wrap(~label, ) +
+  scale_fill_viridis(discrete = TRUE) +
+  labs(title="Figure 12. Comparison of Kernel Density and Risk Predictions",
+       subtitle="2016 Heroin risk predictions; 2017 Heroin") +
+  mapTheme(title_size = 14)
+```
+
+We also calculate the rate of 2017 overdose points by risk category and model type. The risk prediction model outperforms the Kernel Density in the highest risk categories, indicating our tool of medical resource allocation has some value relative to the business-as-usual hot spot approach. 
+
+```{r}
+#The bar plot making this comparison.
+rbind(drug_KDE_sf, drug_risk_sf) %>%
+  st_set_geometry(NULL) %>% na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countDrug = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Rate_of_test_set_drug = countDrug / sum(countDrug)) %>%
+  ggplot(aes(Risk_Category,Rate_of_test_set_drug)) +
+  geom_bar(aes(fill=label), position="dodge", stat="identity") +
+  #scale_fill_viridis(discrete = TRUE) +
+  scale_fill_manual(values = c("#3682be", "#334f65")) +
+  labs(title = "Figure 13. Risk prediction vs. Kernel density, 2017 Heroin Overdose") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+# 3. Usecase Achievement
+
+There are two main functions of Heppro, one is to predict heroin overdose and visulize the outcome, the other is to allocate first-aid packets based on prediction outcome. In order to achieve them, we need to firstly import the data of health care centers in Cincinnati, which can provide medical treatment for overdose patients.
+
+```{r usecase, message=FALSE, warning=FALSE}
+health_center<-read_csv("/Users/tushimin/Desktop/508-final-proj/Cincinnati_Health_Department_Health_Care_Centers.csv")%>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>% 
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102258') %>%
+  mutate(Legend = "Health care centres")
+```
+
+## 3.1 Heroin overdose Prediction 
+
+With the figure 14, officials are able to know the predicted overdose cases in each grid cell of the next year as well as hot spots. Then we create a 1/2-mile for buffer for each heath care center, displaying the distribution health care centers in Cincinnati. 
+
+```{r buffer, message=FALSE, warning=FALSE}
+health_center_buffer <-  rbind(
+  st_buffer(health_center, 800) %>%
+    mutate(Legend = "Buffer") %>%
+    dplyr::select(Legend),
+  st_union(st_buffer(health_center, 800)) %>%
+    st_sf() %>%
+    mutate(Legend = "Unioned Buffer"))
+ggplot() +
+  geom_sf(data=reg.ss.spatialCV, aes(fill = Prediction), colour = NA) +
+  scale_fill_viridis() +
+  geom_sf(data=health_center_buffer, colour = "red", fill = "transparent") +
+  labs(title = "Figure 14. Health care centres distribution under risk prediction", subtitle = "The red border indicates areas within 1/2 mile to health care centers.") +
+  mapTheme()
+```
+
+## 3.2 Overdose first-aid packets allocation
+
+Grid cells in the buffer are places which has rich medical resources, and patients have better accessibility to overdose treatment. For those grid cells, the number of first-aid packets are the half of the predicted count of overdose. And for those not in the buffer, the number of first-aid packets are same to the number of predicted overdose. The figure15 directly show the distribution of overdose first-aid packets allocated for each grid cell. 
+
+```{r map, message=FALSE, warning=FALSE}
+buffer <- filter(health_center_buffer, Legend=="Unioned Buffer")
+
+prediction_outcome <- tibble::rowid_to_column(reg.ss.spatialCV, "ID")
+
+selectCentroids <-
+  st_centroid(prediction_outcome)[buffer,] %>%
+    st_drop_geometry() %>%
+    left_join(dplyr::select(prediction_outcome, ID)) %>%
+    st_sf() %>%
+    mutate(Selection_Type = "Select by Centroids") %>%
+    dplyr::select(ID,Selection_Type)
+
+df <- selectCentroids %>%
+  st_drop_geometry() %>%
+  dplyr::select('ID','Selection_Type') %>%
+  right_join(prediction_outcome,Prediction,by='ID') %>%
+  st_sf()
+
+allocation <- df %>% 
+  st_drop_geometry() %>%
+  mutate(allocation =case_when(
+                        Selection_Type == "Select by Centroids" ~ round(Prediction/2),
+                        TRUE ~ round(Prediction) ))
+  
+allocation <- allocation %>%
+  right_join(df) %>%
+  st_sf()
+
+ggplot() +
+  geom_sf(data=allocation, aes(fill = allocation), colour = NA) +
+  scale_fill_viridis() +
+  labs(title = "Figure 15. Overdose first-aid packets allocation map") +
+  mapTheme()
+```
+
+
+# 4. Improvment in the future
+
+It can't be denied there is selection bias in our original heroin overdose data. Firstly, since the overdose data comes from EMS data for opioid overdose dispatches for Cincinnati, so only overdose cases that received emergency service were recorded, and we must underscore the number of overdose. Secondly, environmental variables like 311 requests are included in our model as predictors. However, the model might be biased against low-income minority communities, since those communities are always despaired because of racist placed-based policies.  
+Besides, risk factors used in our model are mainly from request311 and crime data, which are not comprehensive enough to predict heroin overdose. In the future we will refine our model by including more features, like the alcohol stores and police stations.  
+The generalizability should be optimized in the future too. It's fine that there are overprediction both in white and non-white neighborhoods, but it is unreasonable to under-predict overdose in low-income neighborhoods and over-predict in high-income neighborhoods. Providing insufficient first-aid packets in low-income grid cells is unfair for low-income people.
+
+
+# 5. Conclusion
+
+Heppro application is really useful and efficient in predicting heroin overdose. With Heppro, knowing where heroin overdose cluster, predicting how many overdose cases may happen in each grid cell in the next year, and allocating first-aid packets to grid cells all become so easy. Heppro and first-aid packets can not only save the life of overdose patients, but also reduce the waste of medical resource. It is such an excellent application with outstanding functions that the Department of Health should not miss.
+
+
+video link: https://youtu.be/HHx3fBFHtlA  
+github link: https://github.com/Anran0716/508-final-proj  
+
+
+data source:  
+1. https://data.cincinnati-oh.gov/  
+2. https://data-cagisportal.opendata.arcgis.com/  
+
+
+
